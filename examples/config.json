@@ -1,0 +1,15 @@
+{
+  "说明": "这是 ~/.agent-autoloop/config.json 里 channels 那一段的示例；其他字段保持安装时生成的样子。用飞书群插件时，删掉内置的 feishu 通道。",
+  "channels": {
+    "desktop": { "key": "安装时生成的，不用动" },
+    "group": {
+      "use": "autoloop-feishu-group",
+      "key": "agent-autoloop key new channel group 给的密钥",
+      "chat": "oc_运营群的群号",
+      "user": "ou_你自己的 open_id",
+      "hub": "http://127.0.0.1:3350",
+      "sourceKey": "agent-autoloop key new source feishu-group 给的密钥",
+      "memory": "/Users/你/Desktop/运营助手/知识库.md"
+    }
+  }
+}
