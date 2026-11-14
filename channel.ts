@@ -17,6 +17,10 @@
 //   "messages": false                     只发卡片、收按钮，不收群消息（只给审核人用的机器人）
 //   "table": {"base": "多维表格 token", "table": "表名或 tbl 编号", "profile": "写表用的应用名", "selects": ["单选字段"]}
 //                                         写表用用户身份，profile 对应的应用要 lark-cli auth login 登录过
+//   "chats": ["oc_a", "oc_b"]              这个机器人还服务哪些群（chat 是默认群）；这些群里都能 @ 它
+//   "routes": {"规则名": "oc_x"}            定时规则的卡片发到哪个群；没写的发默认群；群里 @ 聊出来的卡片回原话题
+//   "approvers": "group"                  谁能点同意跟着飞书群角色走：卡片所在群的群主和群管理员。
+//                                         这时 rules.json 里这个通道不写 answerers（写了会挡住名单外的管理员），由插件核对
 //   "askers": ["ou_xx"]                   只接这些人的提问；不写就接群里所有人
 //   "lark": "lark-cli 的完整路径"          Windows 上找不到 lark-cli 时写
 //
@@ -55,7 +59,23 @@ type Context = {
 };
 
 const REPLY = /^回复\s*(om_[A-Za-z0-9_]+)\s*/;
-const TABLE = /^写表/;   // notice 标题以「写表」开头：正文是 {"key": ..., "fields": {...}}，插件写进配置好的那张多维表格，不发消息
+const TABLE = /^写表/;
+// 卡片正文最后一行写「话题：om_xxx」，卡片就发到那个话题里（群里 @ 它聊出来的改动，卡片回到原话题）。
+export const TOPIC = /\n?[ \t]*话题[：:][ \t]*(om_[A-Za-z0-9_]+)[ \t]*$/;
+
+/** 卡片发去哪：话题里聊出来的回原话题；定时规则按 routes 指定的群；都没有就发默认群。 */
+export function routeOf(card: { text: string; rule?: string | null }, chat: string, routes: Record<string, string> = {}) {
+  const topic = TOPIC.exec(card.text || "");
+  const text = topic ? card.text.replace(TOPIC, "") : card.text;
+  if (topic) return { thread: topic[1], chat: null as string | null, text };
+  return { thread: null as string | null, chat: (card.rule && routes[card.rule]) || chat, text };
+}
+
+/** 群主和群管理员才能批（飞书里改群管理员就跟着变）。info 是飞书「获取群信息」接口的返回。 */
+export function mayApprove(info: { owner_id?: string; user_manager_id_list?: string[] } | null, operator: string) {
+  if (!info || !operator) return false;
+  return info.owner_id === operator || (info.user_manager_id_list ?? []).includes(operator);
+}   // notice 标题以「写表」开头：正文是 {"key": ..., "fields": {...}}，插件写进配置好的那张多维表格，不发消息
 
 function safeJson(text: unknown): any {
   if (typeof text !== "string" || !text) return null;
@@ -123,7 +143,12 @@ export default async function feishuGroup({ hub, options, log, signal }: Context
   const chat = options.chat as string;
   const owner = options.user as string;
   const askers = Array.isArray(options.askers) ? (options.askers as string[]) : null;
-  if (!chat?.startsWith("oc_")) throw new Error("飞书群通道要在 config.json 写 chat（oc_ 开头的群号）");
+  if (!chat?.startsWith("oc_")) throw new Error("飞书群通道要在 config.json 写 chat（oc_ 开头的默认群号）");
+  // 一个机器人可以进多个群：chats 里的群都能 @ 它；定时规则的卡片按 routes 发到指定的群。
+  const chats = [...new Set([chat, ...(Array.isArray(options.chats) ? (options.chats as string[]) : [])])];
+  const routes = (options.routes as Record<string, string> | undefined) ?? {};
+  // approvers: "group" 表示谁能点同意跟着飞书群角色走：卡片所在群的群主和群管理员。不写就照 rules.json 的 answerers。
+  const byGroupRole = options.approvers === "group";
   if (!owner?.startsWith("ou_")) throw new Error("飞书群通道要在 config.json 写 user（本人的 open_id）");
 
   const lark = (args: string[], input?: string) =>
@@ -142,8 +167,19 @@ export default async function feishuGroup({ hub, options, log, signal }: Context
       child.stdin?.end(input);
     });
 
-  const sendCard = async (key: string, content: string) =>
-    (await lark(["im", "+messages-send", "--chat-id", chat, "--as", "bot", "--msg-type", "interactive", "--idempotency-key", key, "--content", content])).data.message_id as string;
+  const sendCard = async (key: string, content: string, where: { thread: string | null; chat: string | null }) =>
+    (where.thread
+      ? await lark(["im", "+messages-reply", "--message-id", where.thread, "--reply-in-thread", "--as", "bot", "--msg-type", "interactive", "--idempotency-key", key, "--content", content])
+      : await lark(["im", "+messages-send", "--chat-id", where.chat ?? chat, "--as", "bot", "--msg-type", "interactive", "--idempotency-key", key, "--content", content])).data.message_id as string;
+  const infoCache = new Map<string, { at: number; info: any }>();
+  async function chatInfo(id: string) {
+    const hit = infoCache.get(id);
+    if (hit && Date.now() - hit.at < 60_000) return hit.info;
+    const out = await lark(["api", "GET", `/open-apis/im/v1/chats/${id}`, "--as", "bot"]);
+    const info = out.data ?? out;
+    infoCache.set(id, { at: Date.now(), info });
+    return info;
+  }
   const updateCard = (ref: string, content: string) =>
     lark(["im", "messages", "patch", "--message-id", ref, "--as", "bot", "--data", "-"], JSON.stringify({ content }));
   const replyText = async (to: string, markdown: string, key: string) =>
@@ -202,7 +238,8 @@ export default async function feishuGroup({ hub, options, log, signal }: Context
           await hub.delivered(card.id, card.version, ref);
           continue;
         }
-        const content = JSON.stringify(render(card));
+        const where = routeOf(card, chat, routes);
+        const content = JSON.stringify(render({ ...card, text: where.text }));
         let ref = card.ref;
         if (ref) {
           try {
@@ -210,9 +247,9 @@ export default async function feishuGroup({ hub, options, log, signal }: Context
           } catch (error) {
             if (card.state === "open") throw error;
             log(`卡片 ${card.id} 改不了，重发一张：${error}`);
-            ref = await sendCard(`aa-card-${card.id}-v${card.version}`, content);
+            ref = await sendCard(`aa-card-${card.id}-v${card.version}`, content, where);
           }
-        } else ref = await sendCard(`aa-card-${card.id}`, content);
+        } else ref = await sendCard(`aa-card-${card.id}`, content, where);
         await hub.delivered(card.id, card.version, ref);
       } catch (error) {
         log(`卡片 ${card.id} 没发出去：${error}`);
@@ -226,6 +263,13 @@ export default async function feishuGroup({ hub, options, log, signal }: Context
     const event = JSON.parse(line);
     const value = safeJson(event.action_value);
     if (!Number.isInteger(value?.card) || !Number.isInteger(value?.choice)) return;
+    if (byGroupRole) {
+      // 跟着飞书群角色走：点的人得是这张卡片所在群的群主或群管理员，每次点都现查（缓存 1 分钟）。
+      if (!chats.includes(event.chat_id) || !mayApprove(await chatInfo(event.chat_id), event.operator_id)) {
+        log(`卡片 ${value.card}：${event.operator_id} 不是这个群的群主或管理员，不算`);
+        return;
+      }
+    }
     const answer = await hub.answer(value.card, { choice: value.choice, by: event.operator_id, ref: event.message_id });
     log(`卡片 ${value.card}：${event.operator_id} 点了第 ${value.choice + 1} 项，${answer.changed ? "算数" : "不算（已处理过或不是回答人）"}`);
   }
@@ -236,7 +280,7 @@ export default async function feishuGroup({ hub, options, log, signal }: Context
     const event = JSON.parse(line);
     if (event.sender_type && event.sender_type !== "user") return; // 不接别的机器人的话，免得机器人之间来回对话
     const p2p = event.chat_type === "p2p";
-    if (p2p ? event.sender_id !== owner : event.chat_id !== chat) return;
+    if (p2p ? event.sender_id !== owner : !chats.includes(event.chat_id)) return;
     const root = event.root_id || event.message_id;
     const mentioned = Array.isArray(event.mentions) && event.mentions.length > 0;
     if (!p2p && !mentioned && !threads.has(root)) return;
@@ -265,7 +309,7 @@ export default async function feishuGroup({ hub, options, log, signal }: Context
         type: "feishu.mention",
         subject: root, // 同一个话题 = 同一个事项，规则写 resume 就接着同一段对话
         summary: words.slice(0, 200),
-        detail: JSON.stringify({ 说话人: event.sender_id, 是不是本人: event.sender_id === owner, 原话: words, 话题: root }).slice(0, 4000),
+        detail: JSON.stringify({ 说话人: event.sender_id, 是不是本人: event.sender_id === owner, 原话: words, 话题: root, 群: p2p ? "私聊" : event.chat_id }).slice(0, 4000),
       }),
     });
     if (!response.ok) throw new Error(`中台没收下：${response.status} ${await response.text()}`);
