@@ -1,0 +1,26 @@
+{
+  "说明": "~/.agent-autoloop/config.json 里 channels 这一段的示例。两个通道各用一个飞书机器人（profile 是 lark-cli 里的应用名），一个机器人只能在一台电脑上收按钮。",
+  "channels": {
+    "group": {
+      "use": "autoloop-feishu-group",
+      "key": "agent-autoloop key new channel group 给的密钥",
+      "profile": "补货助手的应用名",
+      "chat": "oc_采购群的群号",
+      "user": "ou_采购负责人在补货助手里的 open_id",
+      "hub": "http://127.0.0.1:3350",
+      "sourceKey": "agent-autoloop key new source feishu-group 给的密钥",
+      "memory": "/Users/你/Desktop/补货助手/知识库.md",
+      "table": { "base": "采购预警表的 token", "table": "预警", "profile": "补货助手的应用名", "selects": ["状态"] }
+    },
+    "approval": {
+      "use": "autoloop-feishu-group",
+      "key": "agent-autoloop key new channel approval 给的密钥",
+      "profile": "审核助手的应用名",
+      "chat": "oc_审核群的群号",
+      "user": "ou_审核人在审核助手里的 open_id",
+      "hub": "http://127.0.0.1:3350",
+      "messages": false,
+      "table": { "base": "采购预警表的 token", "table": "预警", "profile": "补货助手的应用名", "selects": ["状态"] }
+    }
+  }
+}

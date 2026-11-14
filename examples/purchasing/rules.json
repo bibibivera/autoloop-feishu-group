@@ -1,0 +1,33 @@
+{
+  "说明": "两轮采购审核的示例：合进 ~/.agent-autoloop/rules.json 对应的位置。group 是补货助手的通道（采购群，回答人是采购负责人），approval 是审核助手的通道（审核群，回答人是审核人）。两个通道各用一个飞书机器人，open_id 要用各自机器人那边的。",
+  "sources": {
+    "erp": { "name": "多宝鱼 ERP" }
+  },
+  "agents": {
+    "codex": { "name": "Codex", "worker": "this-machine", "use": "codex", "access": "read" }
+  },
+  "channels": {
+    "group": { "name": "采购群", "answerers": ["ou_采购负责人在补货助手里的 open_id"] },
+    "approval": { "name": "采购审核群", "answerers": ["ou_审核人在审核助手里的 open_id"] }
+  },
+  "rules": [
+    {
+      "name": "断货巡检",
+      "when": { "cron": "0 9 * * *" },
+      "to": "codex",
+      "cwd": "~/Desktop/补货助手",
+      "prompt": "先读 skills/断货巡检.md 和 知识库.md，严格照做。",
+      "channels": ["group"],
+      "emits": { "source": "erp", "types": ["po.created"] }
+    },
+    {
+      "name": "采购单审核",
+      "when": { "source": "erp", "types": ["po.created"] },
+      "to": "codex",
+      "cwd": "~/Desktop/补货助手",
+      "prompt": "先读 skills/采购单审核.md 和 知识库.md，严格照做。",
+      "channels": ["approval"],
+      "parallel": 3
+    }
+  ]
+}

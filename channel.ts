@@ -8,11 +8,24 @@
 //   3. Agent 回答时交一个 notice（fyi），标题写「回复 om_xxx」，这里就把正文回复到那个话题里。
 //   4. 本人说「记住：……」，原话加日期追加到知识库文件，不叫 Agent；别人说不记。
 //   5. 不接别的机器人的消息，免得机器人之间来回对话。
+//   6. 一个通道一个机器人（profile）：不同的人（采购负责人、审核人）用不同的机器人和群，各自只认各自的人。
+//   7. 写多维表格：Agent 交一个标题以「写表」开头的 notice，正文 {"key": "...", "fields": {...}}，
+//      插件写进配置好的那张表；同一个 key 再写就是更新那一行。写到哪张表只由配置决定，Agent 只给字段值。
+//
+// config.json 里这个通道的可选项：
+//   "profile": "lark-cli 里的应用名"      这个通道用哪个飞书机器人；不写用 lark-cli 默认的
+//   "messages": false                     只发卡片、收按钮，不收群消息（只给审核人用的机器人）
+//   "table": {"base": "多维表格 token", "table": "表名或 tbl 编号", "profile": "写表用的应用名", "selects": ["单选字段"]}
+//                                         写表用用户身份，profile 对应的应用要 lark-cli auth login 登录过
+//   "askers": ["ou_xx"]                   只接这些人的提问；不写就接群里所有人
+//   "lark": "lark-cli 的完整路径"          Windows 上找不到 lark-cli 时写
 //
 // 安装：agent-autoloop add https://github.com/bibibivera/autoloop-feishu-group
 // 配置见 README.md。
 import { execFile, spawn } from "node:child_process";
-import { appendFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
 type Card = {
   id: number;
@@ -42,6 +55,7 @@ type Context = {
 };
 
 const REPLY = /^回复\s*(om_[A-Za-z0-9_]+)\s*/;
+const TABLE = /^写表/;   // notice 标题以「写表」开头：正文是 {"key": ..., "fields": {...}}，插件写进配置好的那张多维表格，不发消息
 
 function safeJson(text: unknown): any {
   if (typeof text !== "string" || !text) return null;
@@ -103,6 +117,9 @@ function wordsOf(event: any) {
 
 export default async function feishuGroup({ hub, options, log, signal }: Context) {
   const program = (options.lark as string | undefined) ?? "lark-cli";
+  // 每个通道可以用自己的飞书机器人（profile 是 lark-cli 里的应用名）；不写就用 lark-cli 默认的那个。
+  const profile = options.profile ? ["--profile", String(options.profile)] : [];
+  const table = options.table as { base: string; table: string; profile?: string; fields?: string[]; selects?: string[] } | undefined;
   const chat = options.chat as string;
   const owner = options.user as string;
   const askers = Array.isArray(options.askers) ? (options.askers as string[]) : null;
@@ -111,7 +128,7 @@ export default async function feishuGroup({ hub, options, log, signal }: Context
 
   const lark = (args: string[], input?: string) =>
     new Promise<any>((resolve, reject) => {
-      const child = execFile(program, args, { encoding: "utf8", timeout: 60_000, signal, shell: process.platform === "win32" && !program.endsWith(".exe") }, (error, stdout) => {
+      const child = execFile(program, [...args, ...profile], { encoding: "utf8", timeout: 60_000, signal, shell: process.platform === "win32" && !program.endsWith(".exe") }, (error, stdout) => {
         if (error) return reject(error);
         try {
           const out = JSON.parse(stdout);
@@ -132,6 +149,33 @@ export default async function feishuGroup({ hub, options, log, signal }: Context
   const replyText = async (to: string, markdown: string, key: string) =>
     (await lark(["im", "+messages-reply", "--message-id", to, "--reply-in-thread", "--as", "bot", "--idempotency-key", key, "--markdown", markdown])).data.message_id as string;
 
+  // ---------- 写多维表格 ----------
+  const rowsFile = join(process.env.AGENT_AUTOLOOP_HOME ?? join(homedir(), ".agent-autoloop"), `feishu-group-rows-${String(options.table ? (options.table as any).table : "none")}.json`);
+  async function writeRow(text: string) {
+    if (!table?.base || !table?.table) throw new Error("这个通道没配 table，不能写表");
+    const body = safeJson(text);
+    if (!body || typeof body.key !== "string" || typeof body.fields !== "object") throw new Error("写表的正文要是 {\"key\": ..., \"fields\": {...}}");
+    // 单选字段要写成数组；selects 里列的字段，Agent 给的文字自动包一层。
+    const fields = Object.fromEntries(Object.entries(body.fields)
+      .filter(([k]) => !table.fields || table.fields.includes(k))
+      .map(([k, v]) => [k, table.selects?.includes(k) && typeof v === "string" ? [v] : v]));
+    const rows: Record<string, string> = existsSync(rowsFile) ? JSON.parse(readFileSync(rowsFile, "utf8")) : {};
+    const args = ["base", "+record-upsert", "--base-token", table.base, "--table-id", table.table, "--json", JSON.stringify(fields), "--as", "user",
+      ...(rows[body.key] ? ["--record-id", rows[body.key]] : [])];
+    const who = table.profile ? ["--profile", table.profile] : profile;
+    const out = await new Promise<any>((resolve, reject) => {
+      execFile(program, [...args, ...who], { encoding: "utf8", timeout: 60_000, signal, shell: process.platform === "win32" && !program.endsWith(".exe") }, (error, stdout) => {
+        if (error) return reject(error);
+        try { resolve(JSON.parse(stdout)); } catch { reject(new Error("写表没返回 JSON")); }
+      });
+    });
+    if (out.ok === false || out.error) throw new Error("写表失败：" + JSON.stringify(out.error ?? out).slice(0, 200));
+    const id = rows[body.key] ?? (JSON.stringify(out).match(/"(rec[A-Za-z0-9]{8,})"/) || [])[1];
+    if (id && !rows[body.key]) { rows[body.key] = id; writeFileSync(rowsFile, JSON.stringify(rows)); }
+    log(`写表 ${body.key} → ${id ?? "?"}`);
+    return `table-${id ?? body.key}`;
+  }
+
   // ---------- 发卡片、发回复 ----------
   async function deliver() {
     while (!signal.aborted) {
@@ -145,6 +189,12 @@ export default async function feishuGroup({ hub, options, log, signal }: Context
       }
       if (!card) continue;
       try {
+        if (card.kind === "notice" && TABLE.test(card.title)) {
+          // 写表：Agent 只给字段值，写到哪张表由配置决定；同一个 key 第二次写就是更新那一行。
+          const ref = card.ref ?? (await writeRow(card.text));
+          await hub.delivered(card.id, card.version, ref);
+          continue;
+        }
         const reply = card.kind === "notice" ? REPLY.exec(card.title) : null;
         if (reply) {
           // 回答：回复到原话题里，不发卡片。发过一次就不再改。
@@ -226,7 +276,7 @@ export default async function feishuGroup({ hub, options, log, signal }: Context
   async function consume(key: string, handle: (line: string) => Promise<void>) {
     while (!signal.aborted) {
       // stdin 保持打开：lark-cli 在 stdin 关掉时会结束监听
-      const child = spawn(program, ["event", "consume", key, "--as", "bot"], { stdio: ["pipe", "pipe", "pipe"], shell: process.platform === "win32" && !program.endsWith(".exe") });
+      const child = spawn(program, ["event", "consume", key, "--as", "bot", ...profile], { stdio: ["pipe", "pipe", "pipe"], shell: process.platform === "win32" && !program.endsWith(".exe") });
       child.on("error", (error) => log(`${key} 没跑起来：${error}`));
       const stop = () => child.kill();
       signal.addEventListener("abort", stop);
@@ -252,5 +302,6 @@ export default async function feishuGroup({ hub, options, log, signal }: Context
     }
   }
 
-  await Promise.all([deliver(), consume("card.action.trigger", clicked), consume("im.message.receive_v1", said)]);
+  // messages: false 的通道只发卡片、收按钮，不收群消息（比如只给审核人用的机器人）。
+  await Promise.all([deliver(), consume("card.action.trigger", clicked), ...(options.messages === false ? [] : [consume("im.message.receive_v1", said)])]);
 }
