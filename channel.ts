@@ -276,6 +276,8 @@ export default async function feishuGroup({ hub, options, log, signal }: Context
 
   // ---------- 群里 @ 它 ----------
   const threads = new Set<string>(); // 机器人参与过的话题：话题里接着说不用再 @
+  // ack：收到 @ 马上回一句。写 true 用默认的话，写文字就用那句；不写就不回。
+  const ack = options.ack === true ? "收到，正在查，稍等一下。" : typeof options.ack === "string" && options.ack.trim() ? options.ack.trim() : "";
   async function said(line: string) {
     const event = JSON.parse(line);
     if (event.sender_type && event.sender_type !== "user") return; // 不接别的机器人的话，免得机器人之间来回对话
@@ -314,6 +316,10 @@ export default async function feishuGroup({ hub, options, log, signal }: Context
     });
     if (!response.ok) throw new Error(`中台没收下：${response.status} ${await response.text()}`);
     log(`收到 ${event.sender_id} 的提问，话题 ${root}`);
+    if (ack) {
+      // 先回一句，让提问的人知道它在干了；真正的回答等 Agent 跑完再回到同一个话题。
+      await replyText(root, ack, `aa-ack-${event.message_id}`).catch((error) => log(`「收到」没回出去：${error}`));
+    }
   }
 
   // ---------- 一直听着：断了 10 秒后重连 ----------

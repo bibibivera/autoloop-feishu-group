@@ -9,7 +9,8 @@
       "user": "ou_你自己的 open_id",
       "hub": "http://127.0.0.1:3350",
       "sourceKey": "agent-autoloop key new source feishu-group 给的密钥",
-      "memory": "/Users/你/Desktop/运营助手/知识库.md"
+      "memory": "/Users/你/Desktop/运营助手/知识库.md",
+      "ack": true
     }
   }
 }
